@@ -1,0 +1,146 @@
+rm(list = ls())
+set.seed(123)
+library(tidyverse)
+library(lme4)
+library(geepack) #GEE
+library(CRTgeeDR) #Aug-GEE
+library(SuperLearner) # TMLE
+library(tmle) # TMLE
+SLmethods <- c("SL.glm", "SL.rpart", "SL.gam")
+
+# data preprocessing -----
+d <- read.csv("36158-0001-Data.csv") %>%
+  dplyr::select(ADMINLINK, WAVE, EMPLOYEE, STUDYGROUP, CONDITION, RMZFN, RMZEMP, SCWM_CWH) %>%
+  mutate(SCWM_CWH = ifelse(SCWM_CWH >=0, SCWM_CWH, NA)) %>%
+  filter(EMPLOYEE == 1 & WAVE %in% c(1,2)) %>%
+  mutate(WAVE = ifelse(WAVE==1, "baseline", "Y")) %>%
+  pivot_wider(names_from = WAVE, values_from = SCWM_CWH) %>%
+  mutate(treatment = ifelse(CONDITION==1, 1, 0), cluster_id = as.factor(STUDYGROUP)) %>%
+  dplyr::select(A=treatment, cluster_id, RMZFN, RMZEMP, baseline, Y) %>%
+  filter(!is.na(RMZEMP)) #filtered out 8 individuals that are not enrolled into the study
+observed_data <- d %>% left_join(group_by(d, cluster_id) %>% summarise(M = n()), by = "cluster_id") %>%
+  mutate(R_Y = as.numeric(!is.na(Y)), R_X = as.numeric(!is.na(baseline)), RX = ifelse(!is.na(baseline), baseline, 0), RY=Y)
+cl_data <- observed_data %>% group_by(cluster_id) %>% summarise_all(mean)
+m <- nrow(cl_data)
+pi <- 0.5
+
+# Unadjusted-----
+sy <- observed_data %>% group_by(cluster_id) %>% summarise(RY_bar = mean(RY, na.rm=T), A = mean(A))
+unadj_est <- mean(sy$RY_bar[sy$A==1]) - mean(sy$RY_bar[sy$A==0])
+unadj_se <- sqrt(var(sy$RY_bar[sy$A==1])/pi + var(sy$RY_bar[sy$A==0])/(1-pi))/sqrt(m-1)
+
+# IPW-----
+ipw <-geeDREstimation(formula=RY~A, nameY = "RY", nameMISS= "R_Y", nameTRT = "A",
+                      id="cluster_id", data = as.data.frame(observed_data),
+                      family = "gaussian", corstr = "exchangeable",
+                      sandwich.nuisance = T,
+                      model.weights=I(R_Y==1)~A+R_X+RX+RMZFN+RMZEMP+M)
+ipw_est <- summary(ipw)$beta[2]
+ipw_se <- summary(ipw)$se.robust[2]
+
+# DR-aug-GEE----
+aug_gee <- geeDREstimation(formula=RY~A, nameY = "RY", nameMISS= "R_Y", nameTRT = "A",
+                           id="cluster_id" , data = as.data.frame(observed_data),
+                           family = "gaussian", corstr = "exchangeable",
+                           sandwich.nuisance = T, stepwise.augmentation=FALSE,
+                           model.weights=I(R_Y==1)~A+R_X+RX+RMZFN+RMZEMP+M,
+                           model.augmentation.trt= RY~ R_X+RX+RMZFN+RMZEMP+M,
+                           model.augmentation.ctrl= RY~ R_X+RX+RMZFN+RMZEMP+M
+)
+aug_gee_est <- summary(aug_gee)$beta[2]
+aug_gee_se <- summary(aug_gee)$se.robust[2]
+
+# DR-PM -------
+#model treatment assignment
+pi_1 <- glm(A~ R_X+RX+RMZFN+RMZEMP+M, family = binomial, data = cl_data) %>% predict(type = "response")
+pi_0 <- 1-pi_1
+# model missing outcomes
+gee_R_Y <- geeglm(R_Y~A+R_X+RX+RMZFN+RMZEMP+M, id = cluster_id, 
+                  data =observed_data, family = "binomial", corstr = "independence")
+gee_R_Y_A1 <- predict(gee_R_Y, newdata = mutate(observed_data, A=1), type = "response")
+gee_R_Y_A0 <- predict(gee_R_Y, newdata = mutate(observed_data, A=0), type = "response")
+# outcome modeling
+gee_Y <- geeglm(RY~A+R_X+RX+RMZFN+RMZEMP+M, id = cluster_id, 
+                data =observed_data[observed_data$R_Y==1,], family = "gaussian", corstr = "exchangeable")
+gee_Y_A1 <- predict(gee_Y, newdata = mutate(observed_data, A=1), type = "response")
+gee_Y_A0 <- predict(gee_Y, newdata = mutate(observed_data, A=0), type = "response")
+# Compute the EIF
+U <- data.frame(cluster_id = observed_data$cluster_id,
+                U1 = observed_data$A/rep(pi_1, cl_data$M) * ifelse(observed_data$R_Y, observed_data$RY - gee_Y_A1, 0)/gee_R_Y_A1 + gee_Y_A1,
+                U0 = (1-observed_data$A)/rep(pi_0, cl_data$M) * ifelse(observed_data$R_Y, observed_data$RY - gee_Y_A0, 0)/gee_R_Y_A0 + gee_Y_A0) %>%
+  group_by(cluster_id) %>%
+  summarise_all(mean)
+DR_PM_est <- mean(U$U1 - U$U0)
+# Compute the variance correction because of nuisance parameter estimation for outcome missingness
+dd <- model.matrix(R_Y~A+R_X+RX+RMZFN+RMZEMP+M, data = observed_data)
+gee_R_Y_A <- predict(gee_R_Y, type = "response")
+D <- map(cl_data$cluster_id, function(j){
+  index <- which(observed_data$cluster_id ==j)
+  t(dd[index,]) %*% diag(gee_R_Y_A[index] * (1-gee_R_Y_A[index])) %*% dd[index,]
+}) %>% reduce(., `+`)/m
+l1 <- map(cl_data$cluster_id, function(j){
+  index <- which(observed_data$cluster_id ==j)
+  tt <- diag( (1-gee_R_Y_A1[index])/gee_R_Y_A1[index] * ifelse(observed_data$R_Y[index], observed_data$RY[index] - gee_Y_A1[index], 0)) %*% dd[index,]
+  colMeans(tt)
+}) %>% reduce(., `+`)/m
+l0 <- map(cl_data$cluster_id, function(j){
+  index <- which(observed_data$cluster_id ==j)
+  tt <- diag( (1-gee_R_Y_A0[index])/gee_R_Y_A0[index] * ifelse(observed_data$R_Y[index], observed_data$RY[index] - gee_Y_A0[index], 0)) %*% dd[index,]
+  colMeans(tt)
+}) %>% reduce(., `+`)/m
+correction1 <- t(l1 - l0) %*% solve(D) %*% (l1 - l0)
+#  Compute the variance correction because of nuisance parameter estimation for treatment assignment
+dd <- model.matrix(A~R_X+RX+RMZFN+RMZEMP+M, data = cl_data)
+D <- pi * (1-pi) * t(dd) %*% dd
+l1 <- t(aggregate(ifelse(observed_data$R_Y, observed_data$RY - gee_Y_A1, 0)/gee_R_Y_A1, by = list(id=observed_data$cluster_id), mean)[,2]) %*% dd *(1-pi)/m
+l0 <- t(aggregate(ifelse(observed_data$R_Y, observed_data$RY - gee_Y_A0, 0)/gee_R_Y_A0, by = list(id=observed_data$cluster_id), mean)[,2]) %*% dd *(-pi)/m
+correction2 <- (l1 - l0) %*% solve(D) %*% t(l1 - l0)
+# Output se estimate
+DR_PM_se <- sqrt(var(U$U1-U$U0) - correction1 - correction2)/sqrt(m-5)
+DR_PM_1mRY <- mean(1- aggregate(gee_R_Y_A, by = list(observed_data$cluster_id), mean)[,2])
+DR_1mE <- mean((cl_data$RMZEMP-cl_data$M)/cl_data$RMZEMP)
+
+
+# DR-ML --------
+# modeling missing outcomes
+ml_R_Y <- SuperLearner(as.numeric(observed_data$R_Y), X = observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], 
+                       family = "binomial", id=observed_data$cluster_id, SL.library = SLmethods, cvControl = list(V=5))
+ml_R_Y_A1 <- predict(ml_R_Y, newdata = mutate(observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], A=1), type = "response")$pred
+ml_R_Y_A0 <- predict(ml_R_Y, newdata = mutate(observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], A=0), type = "response")$pred
+# outcome modeling
+ml_Y_fitA1 <- SuperLearner(observed_data$RY[observed_data$R_Y==1&observed_data$A==1], 
+                           X = observed_data[observed_data$R_Y==1&observed_data$A==1, c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], 
+                           family = "gaussian", id=observed_data$cluster_id[observed_data$R_Y==1&observed_data$A==1], 
+                           SL.library = SLmethods, cvControl = list(V=5))
+ml_Y_A1 <- predict(ml_Y_fitA1, newdata = observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], type = "response")$pred
+ml_Y_fitA0 <- SuperLearner(observed_data$RY[observed_data$R_Y==1&observed_data$A==0], 
+                           X = observed_data[observed_data$R_Y==1&observed_data$A==0, c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], 
+                           family = "gaussian", id=observed_data$cluster_id[observed_data$R_Y==1&observed_data$A==0], 
+                           SL.library = SLmethods, cvControl = list(V=5))
+ml_Y_A0 <- predict(ml_Y_fitA0, newdata = observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], type = "response")$pred
+# EIF
+U <- data.frame(cluster_id = observed_data$cluster_id,
+                U1 = observed_data$A/pi * ifelse(observed_data$R_Y, observed_data$RY - ml_Y_A1, 0)/ml_R_Y_A1 + ml_Y_A1,
+                U0 = (1-observed_data$A)/(1-pi) * ifelse(observed_data$R_Y, observed_data$RY - ml_Y_A0, 0)/ml_R_Y_A0 + ml_Y_A0) %>%
+  group_by(cluster_id) %>%
+  summarise_all(mean)
+DR_ML_est <- mean(U$U1 - U$U0)
+DR_ML_se <- sd(U$U1 - U$U0)/sqrt(m-5)
+DR_ML_1mRY <- mean(1- aggregate(predict(ml_R_Y, newdata = observed_data[,c("A", "R_X", "RX", "RMZFN", "RMZEMP", "M")], type = "response")$pred, by = list(observed_data$cluster_id), mean)[,2])
+DR_1mE <- mean((cl_data$RMZEMP-cl_data$M)/cl_data$RMZEMP)
+
+
+
+summary_results <- matrix(data = c(unadj_est, unadj_se, ipw_est, ipw_se, aug_gee_est, aug_gee_se, DR_PM_est, DR_PM_se, DR_ML_est, DR_ML_se), nrow = 5, ncol = 2, byrow = T,
+                          dimnames = list(c("unadj", "ipw", "aug-gee", "dr-pm", "dr-ml"), c("est", "sd"))) %>% as.data.frame %>%
+  mutate(ci.lower = est + sd * qt(0.025, m), ci.upper = est + sd * qt(0.975, m))
+xtable::xtable(summary_results)
+# sensitivity under MAR
+summary_results[4,3]/DR_1mE
+summary_results[5,3]/DR_1mE
+# sensitivity under no selection bias
+summary_results[4,3]/DR_PM_1mRY
+summary_results[5,3]/DR_ML_1mRY
+
+
+
